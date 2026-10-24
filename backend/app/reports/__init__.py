@@ -167,6 +167,7 @@ def generate_report_data(db: Session, version_id: str, run_id: Optional[str] = N
             page = db.query(Page).filter(Page.id == ev.page_id).first() if ev.page_id else None
             doc = db.query(Document).filter(Document.id == page.document_id).first() if page else None
             evidence_data.append({
+                "doc_id": doc.id if doc else None,
                 "doc_name": doc.original_name if doc else "",
                 "page_no": page.page_no if page else None,
                 "bbox": ev.bbox,

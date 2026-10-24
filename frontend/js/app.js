@@ -228,6 +228,7 @@ function setupEventListeners() {
         const res = await api.login(targetEmail, password, true);
         if (res.success && res.user) {
           // Invalidate client-side cached data from previous identity
+          clearPdfCache();
           state.user = res.user;
           state.application = null;
           state.reportData = null;
@@ -288,6 +289,7 @@ function setupEventListeners() {
   if (btnLogout) {
     btnLogout.addEventListener("click", async () => {
       if (confirm("Are you sure you want to sign out?")) {
+        clearPdfCache();
         await api.logout();
       }
     });
@@ -505,6 +507,9 @@ function updateUserDisplay() {
 // Load Dashboard Data
 async function loadDashboardData() {
   try {
+    // Ensure document catalog is loaded so document IDs can be resolved for evidence preview
+    await loadDocuments();
+
     const report = await api.getReport("app-demo-0042", 1, "json");
     state.reportData = report;
 
@@ -523,7 +528,9 @@ async function loadDashboardData() {
     // Default select first finding for evidence inspector
     if (report.findings && report.findings.length > 0) {
       const firstDeficient = report.findings.find((f) => f.status === "FAIL") || report.findings[0];
-      selectFindingForEvidence(firstDeficient);
+      await selectFindingForEvidence(firstDeficient);
+    } else {
+      showViewerEmptyState("No findings recorded", "Run verification to evaluate compliance rules.");
     }
 
     // Render graph if currently active
@@ -532,6 +539,7 @@ async function loadDashboardData() {
     }
   } catch (err) {
     showToast(`Failed loading verification report: ${err.message}`, "error");
+    showViewerErrorState(err.message);
   }
 }
 
@@ -588,6 +596,19 @@ function renderFindingsTable() {
     .join("");
 
   // Attach Table Row Click Handlers
+  elements.findingsTableBody.querySelectorAll("tr").forEach((row) => {
+    row.style.cursor = "pointer";
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("button")) return;
+      const btn = row.querySelector(".btn-view-evidence, [data-rule]");
+      const rKey = btn ? btn.dataset.rule : null;
+      if (rKey) {
+        const finding = state.reportData.findings.find((f) => f.rule_key === rKey);
+        if (finding) selectFindingForEvidence(finding);
+      }
+    });
+  });
+
   elements.findingsTableBody.querySelectorAll(".btn-view-evidence").forEach((btn) => {
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -625,80 +646,313 @@ function renderFindingsTable() {
   });
 }
 
-// Select Finding & Inspect Evidence Bounding Box
-function selectFindingForEvidence(finding) {
-  state.selectedFinding = finding;
-  renderFindingsTable();
+// ── PDF.js Evidence Viewer ──────────────────────────────────────────────────
+let pdfjsLibInstance = null;
+let currentRenderTask = null;
+const pdfDocCache = new Map(); // docId -> { doc, blobUrl }
 
-  const ev = (finding.evidence && finding.evidence[0]) || {
-    doc_name: "01_APPLICATION_FORM.pdf",
-    page_no: 1,
-    bbox: [46, 260, 300, 280],
-    snippet: finding.observed_value || "Sanctioned intake",
-  };
-
-  elements.docViewerName.textContent = ev.doc_name;
-  elements.docViewerPage.textContent = `Page ${ev.page_no}`;
-  elements.evidenceSnippetText.textContent = `"${ev.snippet || finding.explanation}"`;
-  elements.evidenceClauseText.textContent = finding.clause_ref || "APH 2026-27 Norms";
-  elements.evidenceConfScore.textContent = `${Math.round((finding.confidence || 0.98) * 100)}%`;
-
-  // Draw simulated document canvas with evidence highlighted
-  drawEvidenceOnCanvas(ev);
+async function getPdfjs() {
+  if (pdfjsLibInstance) return pdfjsLibInstance;
+  try {
+    // Load local self-hosted build first
+    pdfjsLibInstance = await import("/assets/pdfjs/pdf.min.mjs");
+    pdfjsLibInstance.GlobalWorkerOptions.workerSrc = "/assets/pdfjs/pdf.worker.min.mjs";
+    return pdfjsLibInstance;
+  } catch (err) {
+    console.warn("Local PDF.js load failed, falling back to CDN:", err);
+    try {
+      pdfjsLibInstance = await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.6.82/build/pdf.min.mjs");
+      pdfjsLibInstance.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.6.82/build/pdf.worker.min.mjs";
+      return pdfjsLibInstance;
+    } catch (cdnErr) {
+      console.error("Failed to load PDF.js from CDN:", cdnErr);
+      throw new Error("PDF viewer engine unavailable");
+    }
+  }
 }
 
-// Draw Synthetic Document Page & Highlight Evidence Box
-function drawEvidenceOnCanvas(ev) {
+function cleanupViewerResources() {
+  if (currentRenderTask) {
+    try {
+      currentRenderTask.cancel();
+    } catch (_) {}
+    currentRenderTask = null;
+  }
+}
+
+function clearPdfCache() {
+  cleanupViewerResources();
+  for (const entry of pdfDocCache.values()) {
+    if (entry && entry.blobUrl) {
+      try {
+        URL.revokeObjectURL(entry.blobUrl);
+      } catch (_) {}
+    }
+  }
+  pdfDocCache.clear();
+}
+
+function showViewerEmptyState(message = "No document attached", subtext = "") {
+  cleanupViewerResources();
   const canvas = elements.evidenceCanvas;
   if (!canvas) return;
   const ctx = canvas.getContext("2d");
-  
-  canvas.width = 460;
-  canvas.height = 620;
 
-  // Document Page Background
-  ctx.fillStyle = "#ffffff";
+  canvas.width = 460;
+  canvas.height = 360;
+  canvas.style.display = "block";
+  canvas.style.maxWidth = "100%";
+  canvas.style.height = "auto";
+  canvas.style.boxShadow = "none";
+  canvas.style.borderRadius = "8px";
+
+  // Clean slate background with subtle border
+  ctx.fillStyle = "#0B132B";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Document Header Banner
-  ctx.fillStyle = "#1e293b";
-  ctx.fillRect(20, 20, canvas.width - 40, 35);
-  ctx.fillStyle = "#ffffff";
-  ctx.font = "bold 11px Inter, sans-serif";
-  ctx.fillText("AICTE VERIFICATION SYNTHETIC DOCUMENT", 30, 42);
+  ctx.strokeStyle = "#1E293B";
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(16, 16, canvas.width - 32, canvas.height - 32);
 
-  // Document Lines (Simulated Text)
-  ctx.fillStyle = "#cbd5e1";
-  for (let y = 75; y < 580; y += 18) {
-    const lineWidth = (y % 36 === 0) ? canvas.width - 120 : canvas.width - 60;
-    ctx.fillRect(30, y, lineWidth, 8);
+  // Document Icon placeholder
+  ctx.fillStyle = "#334155";
+  ctx.fillRect(canvas.width / 2 - 24, 100, 48, 60);
+  ctx.fillStyle = "#0B132B";
+  ctx.fillRect(canvas.width / 2 - 20, 104, 40, 52);
+
+  // Main text
+  ctx.fillStyle = "#E2E8F0";
+  ctx.font = "bold 13px Inter, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(message, canvas.width / 2, 200);
+
+  // Subtext
+  if (subtext) {
+    ctx.fillStyle = "#94A3B8";
+    ctx.font = "11px Inter, sans-serif";
+    const displaySub = subtext.length > 55 ? subtext.substring(0, 52) + "..." : subtext;
+    ctx.fillText(displaySub, canvas.width / 2, 226);
+  }
+  ctx.textAlign = "start";
+}
+
+function showViewerLoadingState(docName = "document") {
+  cleanupViewerResources();
+  const canvas = elements.evidenceCanvas;
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+
+  canvas.width = 460;
+  canvas.height = 360;
+  canvas.style.display = "block";
+  canvas.style.maxWidth = "100%";
+  canvas.style.height = "auto";
+  canvas.style.boxShadow = "none";
+
+  ctx.fillStyle = "#0F172A";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.fillStyle = "#38BDF8";
+  ctx.font = "bold 13px Inter, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(`Loading ${docName}...`, canvas.width / 2, 175);
+
+  ctx.fillStyle = "#94A3B8";
+  ctx.font = "11px Inter, sans-serif";
+  ctx.fillText("Fetching authentic PDF from storage & rendering page...", canvas.width / 2, 202);
+  ctx.textAlign = "start";
+}
+
+function showViewerErrorState(errorMessage) {
+  cleanupViewerResources();
+  const canvas = elements.evidenceCanvas;
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+
+  canvas.width = 460;
+  canvas.height = 360;
+  canvas.style.display = "block";
+  canvas.style.maxWidth = "100%";
+  canvas.style.height = "auto";
+  canvas.style.boxShadow = "none";
+
+  ctx.fillStyle = "#1E1E2E";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.strokeStyle = "#7F1D1D";
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(16, 16, canvas.width - 32, canvas.height - 32);
+
+  ctx.fillStyle = "#EF4444";
+  ctx.font = "bold 13px Inter, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("Failed to load PDF preview", canvas.width / 2, 160);
+
+  ctx.fillStyle = "#FCA5A5";
+  ctx.font = "11px Inter, sans-serif";
+  ctx.fillText(errorMessage || "Document could not be retrieved", canvas.width / 2, 190);
+  ctx.textAlign = "start";
+}
+
+// Render Authentic PDF Page & Overlay Evidence Coordinates
+async function renderPdfEvidence(docId, docName, pageNo = 1, bbox = null) {
+  cleanupViewerResources();
+  const canvas = elements.evidenceCanvas;
+  if (!canvas) return;
+
+  if (!docId) {
+    showViewerEmptyState("Document not found", `No record found for "${docName || 'this file'}".`);
+    return;
   }
 
-  // Highlight Box Coordinates scaled to canvas
-  const bbox = ev.bbox || [46, 260, 300, 280];
-  // PDF standard is 595x842. Scale to canvas (460x620)
-  const scaleX = canvas.width / 595;
-  const scaleY = canvas.height / 842;
+  showViewerLoadingState(docName || "document");
 
-  const bx = bbox[0] * scaleX;
-  const by = bbox[1] * scaleY;
-  const bw = Math.max(80, (bbox[2] - bbox[0]) * scaleX);
-  const bh = Math.max(22, (bbox[3] - bbox[1]) * scaleY);
+  try {
+    const pdfjs = await getPdfjs();
+    let pdfDoc = null;
 
-  // Glowing Highlight Box
-  ctx.strokeStyle = "#ef4444";
-  ctx.lineWidth = 2.5;
-  ctx.strokeRect(bx, by, bw, bh);
+    if (pdfDocCache.has(docId)) {
+      pdfDoc = pdfDocCache.get(docId).doc;
+    } else {
+      const blob = await api.getDocumentPdf(docId);
+      const blobUrl = URL.createObjectURL(blob);
+      const loadingTask = pdfjs.getDocument({ url: blobUrl });
+      pdfDoc = await loadingTask.promise;
+      pdfDocCache.set(docId, { doc: pdfDoc, blobUrl });
+    }
 
-  ctx.fillStyle = "rgba(239, 68, 68, 0.25)";
-  ctx.fillRect(bx, by, bw, bh);
+    const targetPageNo = Math.max(1, Math.min(pageNo || 1, pdfDoc.numPages));
+    const page = await pdfDoc.getPage(targetPageNo);
 
-  // Label tag above highlight
-  ctx.fillStyle = "#ef4444";
-  ctx.fillRect(bx, by - 16, 95, 14);
-  ctx.fillStyle = "#ffffff";
-  ctx.font = "bold 8px Inter, sans-serif";
-  ctx.fillText("SOURCE EVIDENCE", bx + 4, by - 5);
+    // Compute scale to fit comfortably in preview container
+    const parent = canvas.parentElement;
+    const availableWidth = (parent && parent.clientWidth > 100) ? (parent.clientWidth - 32) : 480;
+    const unscaledViewport = page.getViewport({ scale: 1.0 });
+    const scale = Math.max(0.6, Math.min(1.8, availableWidth / unscaledViewport.width));
+    const viewport = page.getViewport({ scale });
+
+    canvas.width = Math.floor(viewport.width);
+    canvas.height = Math.floor(viewport.height);
+    canvas.style.display = "block";
+    canvas.style.maxWidth = "100%";
+    canvas.style.height = "auto";
+    canvas.style.boxShadow = "0 4px 16px rgba(0,0,0,0.4)";
+    canvas.style.borderRadius = "4px";
+
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    currentRenderTask = page.render({
+      canvasContext: ctx,
+      viewport: viewport,
+    });
+    await currentRenderTask.promise;
+    currentRenderTask = null;
+
+    // Overlay evidence bounding box highlight if valid coordinates exist
+    if (bbox && Array.isArray(bbox) && bbox.length === 4) {
+      const [x0, y0, x1, y1] = bbox;
+      if (x1 > x0 && y1 > y0) {
+        const scaleX = viewport.width / unscaledViewport.width;
+        const scaleY = viewport.height / unscaledViewport.height;
+
+        const bx = x0 * scaleX;
+        const by = y0 * scaleY;
+        const bw = (x1 - x0) * scaleX;
+        const bh = (y1 - y0) * scaleY;
+
+        ctx.save();
+        ctx.fillStyle = "rgba(239, 68, 68, 0.22)";
+        ctx.fillRect(bx, by, bw, bh);
+
+        ctx.strokeStyle = "#ef4444";
+        ctx.lineWidth = 2.5;
+        ctx.strokeRect(bx, by, bw, bh);
+
+        // Badge tag above highlight box
+        const tagHeight = 16;
+        const tagWidth = 100;
+        const tagY = Math.max(0, by - tagHeight);
+        ctx.fillStyle = "#ef4444";
+        ctx.fillRect(bx, tagY, tagWidth, tagHeight);
+
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold 9px Inter, sans-serif";
+        ctx.fillText("SOURCE EVIDENCE", bx + 6, tagY + 11);
+        ctx.restore();
+      }
+    }
+  } catch (err) {
+    if (err && err.name === "RenderingCancelledException") {
+      return;
+    }
+    console.error("PDF preview error:", err);
+    showViewerErrorState(err.message || "Failed to render PDF page.");
+  }
+}
+
+// Select Finding & Inspect Evidence Bounding Box
+async function selectFindingForEvidence(finding) {
+  if (!finding) return;
+  state.selectedFinding = finding;
+  renderFindingsTable();
+
+  const ev = (finding.evidence && finding.evidence.length > 0) ? finding.evidence[0] : null;
+
+  if (!ev) {
+    // Empty state: finding has no document or page evidence
+    if (elements.docViewerName) elements.docViewerName.textContent = "No Document Attached";
+    if (elements.docViewerPage) elements.docViewerPage.textContent = "N/A";
+    if (elements.evidenceSnippetText) {
+      elements.evidenceSnippetText.textContent = `"${finding.explanation || 'No document text reference available for this rule.'}"`;
+    }
+    if (elements.evidenceClauseText) elements.evidenceClauseText.textContent = finding.clause_ref || "AICTE APH Norms";
+    if (elements.evidenceConfScore) elements.evidenceConfScore.textContent = `${Math.round((finding.confidence || 1.0) * 100)}%`;
+
+    const statusBadge = document.getElementById("evidenceStatusBadge");
+    if (statusBadge) {
+      statusBadge.textContent = "Checklist Rule";
+      statusBadge.className = "badge badge-info";
+    }
+
+    showViewerEmptyState(
+      "No Document Required",
+      finding.explanation || "This rule verifies overall checklist completeness without an individual document page."
+    );
+    return;
+  }
+
+  // Resolve document ID from finding evidence or state.documents
+  let docId = ev.doc_id;
+  if (!docId && state.documents && state.documents.length > 0) {
+    const match = state.documents.find(
+      (d) => d.id === ev.doc_id || d.original_name === ev.doc_name || d.doc_type === ev.doc_name
+    );
+    if (match) docId = match.id;
+  }
+
+  if (elements.docViewerName) elements.docViewerName.textContent = ev.doc_name || "Document Preview";
+  if (elements.docViewerPage) elements.docViewerPage.textContent = `Page ${ev.page_no || 1}`;
+  if (elements.evidenceSnippetText) {
+    elements.evidenceSnippetText.textContent = `"${ev.snippet || finding.observed_value || finding.explanation || ''}"`;
+  }
+  if (elements.evidenceClauseText) elements.evidenceClauseText.textContent = finding.clause_ref || "APH 2026-27 Norms";
+  if (elements.evidenceConfScore) {
+    elements.evidenceConfScore.textContent = `${Math.round((finding.confidence || 0.98) * 100)}%`;
+  }
+
+  const statusBadge = document.getElementById("evidenceStatusBadge");
+  if (statusBadge) {
+    if (ev.bbox && Array.isArray(ev.bbox) && ev.bbox.length === 4) {
+      statusBadge.textContent = "Evidence Verified";
+      statusBadge.className = "badge badge-pass";
+    } else {
+      statusBadge.textContent = "Document Linked";
+      statusBadge.className = "badge badge-info";
+    }
+  }
+
+  await renderPdfEvidence(docId, ev.doc_name, ev.page_no || 1, ev.bbox);
 }
 
 // Render Interactive SVG Cross-Document Consistency Graph
@@ -936,14 +1190,14 @@ async function loadRulebooks() {
   }
 }
 
-// Default documents for initial load/demo
+// Authentic synthetic documents seeded into storage & database workflow
 const DEFAULT_DOCUMENTS = [
-  { doc_type: "APPLICATION_FORM", original_name: "01_APPLICATION_FORM.pdf", size: "8.4 KB", sha256: "e4b1a789234fdc10a45b7891234cdef0123456789abcdef0123456789abcdef0", scan_status: "DONE" },
-  { doc_type: "FACULTY_LIST", original_name: "02_FACULTY_LIST.pdf", size: "11.0 KB", sha256: "78c2d901234abcde5678f01234567890abcdef123456789abcdef0123456789a", scan_status: "DONE" },
-  { doc_type: "FINANCIAL_STATEMENT", original_name: "03_FINANCIAL_STATEMENT.pdf", size: "5.4 KB", sha256: "89f0e1234567890abcdef123456789abcdef0123456789abcdef0123456789ab", scan_status: "DONE" },
-  { doc_type: "LAND_DEED", original_name: "04_LAND_DEED.pdf", size: "4.0 KB", sha256: "12a3b4567890abcdef123456789abcdef0123456789abcdef0123456789abcde", scan_status: "DONE" },
-  { doc_type: "BUILDING_PLAN", original_name: "05_BUILDING_PLAN.pdf", size: "4.5 KB", sha256: "98e7d6543210fedcba9876543210fedcba9876543210fedcba9876543210fedc", scan_status: "DONE" },
-  { doc_type: "FACULTY_AFFIDAVIT", original_name: "06_FACULTY_AFFIDAVIT.pdf", size: "4.4 KB", sha256: "56f7a8901234abcdef0123456789abcdef0123456789abcdef0123456789abcdef", scan_status: "DONE" },
+  { id: "9d961595-e6b6-4446-8916-7b42b0ed75bc", doc_type: "APPLICATION_FORM", original_name: "01_APPLICATION_FORM.pdf", size: "8.4 KB", sha256: "f60efdd7331d49a565f263c5cacd836e831bb91746c40cff0535d6a037953358", scan_status: "DONE", page_count: 1 },
+  { id: "9bee6b08-f094-407e-91da-45715e0c1f0f", doc_type: "FACULTY_LIST", original_name: "02_FACULTY_LIST.pdf", size: "11.0 KB", sha256: "31028b0827ff9aa276365725d3a457ed9dd1e3666867f483d841ec63dfca4349", scan_status: "DONE", page_count: 1 },
+  { id: "b9c5da61-db67-4d7f-bcd6-e21668ea3b70", doc_type: "FINANCIAL_STATEMENT", original_name: "03_FINANCIAL_STATEMENT.pdf", size: "5.4 KB", sha256: "f20b7f5947aa1ec3b8112752fdced281e138dad36512f66036cdea52fe3e75f7", scan_status: "DONE", page_count: 1 },
+  { id: "da1434cf-92ad-4b44-9be2-16951282d9c3", doc_type: "LAND_DEED", original_name: "04_LAND_DEED.pdf", size: "4.0 KB", sha256: "1d2ccf9d089cc9fe7878905c1eea42681f02335d40d7a50e2eda54c8ad447b73", scan_status: "DONE", page_count: 1 },
+  { id: "447560fe-332a-47d6-9107-9fff1e3b34bd", doc_type: "BUILDING_PLAN", original_name: "05_BUILDING_PLAN.pdf", size: "4.5 KB", sha256: "bcab7aa1224db458675cf2afcfd55edb4fe27e973e28400bf4281d345f0ee324", scan_status: "DONE", page_count: 1 },
+  { id: "4ba4642c-4b8c-4695-b2f7-2a3af8c7ae04", doc_type: "FACULTY_AFFIDAVIT", original_name: "06_FACULTY_AFFIDAVIT.pdf", size: "4.4 KB", sha256: "ca77f1d6ccc56de405cd6df0db2bb9e6435582f976f9de525246de15d0bd25ba", scan_status: "DONE", page_count: 1 },
 ];
 
 function escapeHtml(str) {

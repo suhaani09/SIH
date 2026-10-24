@@ -167,6 +167,38 @@ class ApiClient {
     }
   }
 
+  /**
+   * Fetch the raw PDF binary for a document by its document ID.
+   * Returns a Blob suitable for use with URL.createObjectURL().
+   * Throws on auth failures or missing documents.
+   */
+  async getDocumentPdf(docId) {
+    const headers = {};
+    if (this.token) {
+      headers["Authorization"] = `Bearer ${this.token}`;
+    }
+    const res = await fetch(`${API_BASE}/documents/${docId}/pdf`, {
+      credentials: "include",
+      headers,
+    });
+    if (res.status === 401) {
+      this.setToken(null, null);
+      if (!window.location.pathname.includes("login")) {
+        window.location.href = "/login";
+      }
+      throw new Error("Authentication required");
+    }
+    if (!res.ok) {
+      let errMessage = `HTTP error ${res.status}`;
+      try {
+        const errData = await res.json();
+        errMessage = errData.detail || errMessage;
+      } catch (_) {}
+      throw new Error(errMessage);
+    }
+    return await res.blob();
+  }
+
   async uploadDocument(appId, vno = 1, file, docType = "AUTO") {
     if (!this.token) {
       throw new Error("Authentication required. Please sign in to upload documents.");
@@ -223,8 +255,8 @@ class ApiClient {
             observed_value: "58 / 1200 = 0.0483 (1:20.7)",
             explanation: "Faculty count of 58 is deficient for sanctioned intake of 1200. Minimum 80 faculty required.",
             evidence: [
-              { doc_name: "02_FACULTY_LIST.pdf", page_no: 1, bbox: [46, 500, 300, 520], snippet: "Total Teaching Faculty: 58" },
-              { doc_name: "01_APPLICATION_FORM.pdf", page_no: 1, bbox: [46, 260, 300, 280], snippet: "Sanctioned Intake Total: 1200" }
+              { doc_id: "9bee6b08-f094-407e-91da-45715e0c1f0f", doc_name: "02_FACULTY_LIST.pdf", page_no: 1, bbox: [46, 500, 300, 520], snippet: "Total Teaching Faculty: 58" },
+              { doc_id: "9d961595-e6b6-4446-8916-7b42b0ed75bc", doc_name: "01_APPLICATION_FORM.pdf", page_no: 1, bbox: [46, 260, 300, 280], snippet: "Sanctioned Intake Total: 1200" }
             ]
           },
           {
@@ -237,7 +269,7 @@ class ApiClient {
             required_value: "1:2:6 ratio (Prof >= 10%)",
             observed_value: "6 Professors / 58 = 10.3%",
             explanation: "Cadre proportion is compliant with cadre norms.",
-            evidence: [{ doc_name: "02_FACULTY_LIST.pdf", page_no: 1, bbox: [46, 320, 300, 340], snippet: "Professors: 6" }]
+            evidence: [{ doc_id: "9bee6b08-f094-407e-91da-45715e0c1f0f", doc_name: "02_FACULTY_LIST.pdf", page_no: 1, bbox: [46, 320, 300, 340], snippet: "Professors: 6" }]
           },
           {
             rule_key: "BUILTUP_AREA_UG_ENGG",
@@ -249,7 +281,7 @@ class ApiClient {
             required_value: "15.0 sqm/student",
             observed_value: "24,000 sqm / 1200 = 20.0 sqm/student",
             explanation: "Observed area 20.0 sqm/student meets minimum requirement 15.0.",
-            evidence: [{ doc_name: "01_APPLICATION_FORM.pdf", page_no: 1, bbox: [46, 300, 350, 320], snippet: "Built-up Area: 24,000 sq m" }]
+            evidence: [{ doc_id: "9d961595-e6b6-4446-8916-7b42b0ed75bc", doc_name: "01_APPLICATION_FORM.pdf", page_no: 1, bbox: [46, 300, 350, 320], snippet: "Built-up Area: 24,000 sq m" }]
           },
           {
             rule_key: "LAND_AREA_UG_ENGG",
@@ -261,7 +293,7 @@ class ApiClient {
             required_value: "2.5 Acres",
             observed_value: "3.0 Acres",
             explanation: "Land area 3.0 Acres satisfies the minimum requirement of 2.5 Acres.",
-            evidence: [{ doc_name: "01_APPLICATION_FORM.pdf", page_no: 1, bbox: [46, 280, 300, 300], snippet: "Land Area: 3.0 Acres" }]
+            evidence: [{ doc_id: "9d961595-e6b6-4446-8916-7b42b0ed75bc", doc_name: "01_APPLICATION_FORM.pdf", page_no: 1, bbox: [46, 280, 300, 300], snippet: "Land Area: 3.0 Acres" }]
           },
           {
             rule_key: "FIN_CORPUS_UG_ENGG",
@@ -273,7 +305,7 @@ class ApiClient {
             required_value: "Rs. 5.00 Crore",
             observed_value: "Rs. 6.00 Crore",
             explanation: "Audited financial corpus meets normative financial safety threshold.",
-            evidence: [{ doc_name: "03_FINANCIAL_STATEMENT.pdf", page_no: 1, bbox: [46, 200, 350, 220], snippet: "Corpus Fund: Rs. 6.00 Crores" }]
+            evidence: [{ doc_id: "b9c5da61-db67-4d7f-bcd6-e21668ea3b70", doc_name: "03_FINANCIAL_STATEMENT.pdf", page_no: 1, bbox: [46, 200, 350, 220], snippet: "Corpus Fund: Rs. 6.00 Crores" }]
           },
           {
             rule_key: "DOC_COMPLETENESS",

@@ -5,6 +5,18 @@ import pytest
 BASE_URL = "http://127.0.0.1:8000"
 
 
+@pytest.fixture(autouse=True, scope="module")
+def ensure_server_running():
+    """Skip live integration tests if the local server is not actively running."""
+    try:
+        with httpx.Client(base_url=BASE_URL, timeout=1.5) as client:
+            r = client.get("/health")
+            if r.status_code != 200:
+                pytest.skip("Live server at http://127.0.0.1:8000 is not responding")
+    except Exception:
+        pytest.skip("Live server at http://127.0.0.1:8000 is not running")
+
+
 def test_live_routes_and_assets():
     with httpx.Client(base_url=BASE_URL, follow_redirects=True) as client:
         # 1. Landing page

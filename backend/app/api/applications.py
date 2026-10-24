@@ -1,10 +1,12 @@
 """Applications API: create applications, upload documents, trigger verification."""
 from __future__ import annotations
+import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Query
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from pydantic import BaseModel
@@ -207,6 +209,55 @@ def _process_doc_sync(document_id: str):
     """Fallback: run OCR synchronously if Redis unavailable."""
     from app.worker import process_document
     process_document(document_id)
+
+
+# ─── Document PDF retrieval ───────────────────────────────────────────────────
+
+@router.get("/documents/{doc_id}/pdf")
+def get_document_pdf(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the raw PDF binary for a document, after verifying access rights.
+
+    Access rules mirror the application-level access check:
+    - Institution admin may only access documents belonging to their institution.
+    - Scrutiny officer may only access documents from applications that are
+      either unassigned or assigned to themselves.
+    - Senior reviewers, system admins, auditors, and curators have read access.
+    The storage key is never exposed to the caller.
+    """
+    doc = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(404, "Document not found")
+
+    # Resolve owning application for access check
+    version = db.query(ApplicationVersion).filter(
+        ApplicationVersion.id == doc.version_id
+    ).first()
+    if not version:
+        raise HTTPException(404, "Application version not found")
+
+    owning_app = db.query(Application).filter(
+        Application.id == version.application_id
+    ).first()
+    if not owning_app:
+        raise HTTPException(404, "Application not found")
+
+    _check_app_access(owning_app, current_user)
+
+    pdf_path = retrieve_path(doc.storage_key)
+    if not pdf_path.exists():
+        raise HTTPException(404, "Document file not found in storage")
+
+    safe_name = Path(doc.original_name).name if doc.original_name else "document.pdf"
+    return FileResponse(
+        str(pdf_path),
+        media_type=doc.mime or "application/pdf",
+        filename=safe_name,
+        headers={"Content-Disposition": f'inline; filename="{safe_name}"'},
+    )
 
 
 @router.get("/applications/{app_id}/versions/{vno}/documents")

@@ -239,6 +239,56 @@ else:
     print("  Demo application already exists")
 
 db.commit()
+
+# ─── Seed Demo Synthetic Documents into Storage & DB ─────────────────────────
+try:
+    from app.models import Document, ScanStatus
+    from app.config import get_settings
+    settings = get_settings()
+    root = Path(settings.STORAGE_ROOT)
+    synthetic_dir = Path(__file__).parent.parent.parent / "data" / "synthetic" / "output"
+
+    docs_def = [
+        {"filename": "01_APPLICATION_FORM.pdf",  "doc_type": "APPLICATION_FORM"},
+        {"filename": "02_FACULTY_LIST.pdf",       "doc_type": "FACULTY_LIST"},
+        {"filename": "03_FINANCIAL_STATEMENT.pdf","doc_type": "FINANCIAL_STATEMENT"},
+        {"filename": "04_LAND_DEED.pdf",          "doc_type": "LAND_DEED"},
+        {"filename": "05_BUILDING_PLAN.pdf",      "doc_type": "BUILDING_PLAN"},
+        {"filename": "06_FACULTY_AFFIDAVIT.pdf",  "doc_type": "FACULTY_AFFIDAVIT"},
+    ]
+    for d_def in docs_def:
+        src = synthetic_dir / d_def["filename"]
+        if src.exists():
+            with open(src, "rb") as f:
+                content = f.read()
+            sha = hashlib.sha256(content).hexdigest()
+            dest = root / sha[:2] / sha[2:4] / sha
+            if not dest.exists():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with open(dest, "wb") as f:
+                    f.write(content)
+            key = f"{sha[:2]}/{sha[2:4]}/{sha}"
+            existing_doc = db.query(Document).filter(
+                Document.version_id == "appv-demo-0042-v1",
+                Document.original_name == d_def["filename"],
+            ).first()
+            if not existing_doc:
+                db_doc = Document(
+                    version_id="appv-demo-0042-v1",
+                    doc_type=d_def["doc_type"],
+                    original_name=d_def["filename"],
+                    mime="application/pdf",
+                    sha256=sha,
+                    storage_key=key,
+                    page_count=1,
+                    scan_status=ScanStatus.DONE,
+                )
+                db.add(db_doc)
+    db.commit()
+    print("  Demo PDF documents verified/seeded into storage.")
+except Exception as e:
+    print(f"  Note: Demo documents check skipped ({e})")
+
 print("\nSeed complete!")
 print("\nDemo users (password: demo1234):")
 for ud in users_data:
